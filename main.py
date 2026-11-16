@@ -1,342 +1,344 @@
 import os
+import time
 import requests
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
 from matplotlib.patches import Rectangle
-from datetime import datetime, timezone
+
 
 # ================= CONFIG =================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_URL = "https://data-api.binance.vision"
 
-CHARTS = {
+SYMBOLS = {
     "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT"
+    "ETH": "ETHUSDT",
 }
 
-TIMEFRAME = "12h"
-CANDLES = 100
-
-# ================= TELEGRAM =================
-
-def telegram_message(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    r = requests.post(
-        url,
-        data={"chat_id": CHANNEL_ID, "text": message},
-        timeout=30
-    )
-    r.raise_for_status()
+INTERVAL = "12h"
+LIMIT = 100
 
 
-def telegram_photo(path, caption):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-
-    with open(path, "rb") as photo:
-        r = requests.post(
-            url,
-            data={
-                "chat_id": CHANNEL_ID,
-                "caption": caption
-            },
-            files={"photo": photo},
-            timeout=60
-        )
-
-    r.raise_for_status()
-
-
-# ================= MARKET DATA =================
+# ================= DATA =================
 
 def get_binance_data(symbol):
 
-    r = requests.get(
-        BINANCE_URL,
-        params={
-            "symbol": symbol,
-            "interval": TIMEFRAME,
-            "limit": CANDLES
-        },
-        timeout=30
-    )
+    url = f"{BINANCE_URL}/api/v3/klines"
 
-    r.raise_for_status()
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "limit": LIMIT
+    }
 
-    rows = r.json()
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
 
-    df = pd.DataFrame(rows, columns=[
-        "time", "open", "high", "low", "close",
-        "volume", "close_time", "quote_volume",
-        "trades", "taker_buy", "taker_quote", "ignore"
+    data = response.json()
+
+    df = pd.DataFrame(data, columns=[
+        "time", "open", "high", "low",
+        "close", "volume", "close_time",
+        "quote_volume", "trades",
+        "buy_volume", "buy_quote", "ignore"
     ])
 
     df["time"] = pd.to_datetime(df["time"], unit="ms")
 
     for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col])
+        df[col] = df[col].astype(float)
 
     return df[["time", "open", "high", "low", "close"]]
 
 
+# ================= YAHOO FALLBACK =================
+
+def get_yahoo_data(symbol):
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+    params = {
+        "range": "60d",
+        "interval": "1h"
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    result = response.json()["chart"]["result"][0]
+
+    timestamps = result["timestamp"]
+    quote = result["indicators"]["quote"][0]
+
+    df = pd.DataFrame({
+        "time": pd.to_datetime(timestamps, unit="s"),
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "close": quote["close"]
+    })
+
+    df = df.dropna()
+
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df["time"] = df["time"].dt.tz_convert(None)
+
+    df = df.set_index("time")
+
+    df = df.resample("12h").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).dropna().reset_index()
+
+    return df.tail(LIMIT)
+
+
+# ================= GOLD =================
+
 def get_gold_data():
 
-    tickers = ["XAUUSD=X", "GC=F"]
+    errors = []
 
-    for ticker in tickers:
+    for symbol in ["XAUUSD=X", "GC=F"]:
 
         try:
-            url = (
-                f"https://query1.finance.yahoo.com/v8/finance/chart/"
-                f"{ticker}?range=60d&interval=1h"
-            )
+            df = get_yahoo_data(symbol)
 
-            r = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=30
-            )
-
-            r.raise_for_status()
-
-            result = r.json()["chart"]["result"][0]
-
-            timestamps = result["timestamp"]
-            quote = result["indicators"]["quote"][0]
-
-            df = pd.DataFrame({
-                "time": pd.to_datetime(
-                    timestamps, unit="s", utc=True
-                ).tz_convert(None),
-                "open": quote["open"],
-                "high": quote["high"],
-                "low": quote["low"],
-                "close": quote["close"]
-            })
-
-            df = df.dropna()
-
-            df = df.set_index("time").resample("12h").agg({
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last"
-            }).dropna().reset_index()
-
-            if len(df) >= 20:
-                return df.tail(CANDLES)
+            if len(df) >= 30:
+                print(f"GOLD SOURCE: {symbol}")
+                return df
 
         except Exception as e:
-            print(f"Gold source error {ticker}: {e}")
+            errors.append(f"{symbol}: {e}")
+            print("Gold source error:", symbol, e)
 
-    raise RuntimeError("Gold market data unavailable")
+    raise Exception("Gold data unavailable: " + str(errors))
 
 
 # ================= SUPPORT / RESISTANCE =================
 
 def find_zones(df):
 
-    high = df["high"].tolist()
-    low = df["low"].tolist()
-
-    atr = (
-        df["high"] - df["low"]
-    ).rolling(14).mean().iloc[-1]
-
-    if pd.isna(atr) or atr <= 0:
-        atr = df["close"].iloc[-1] * 0.005
-
     supports = []
     resistances = []
 
+    highs = df["high"].values
+    lows = df["low"].values
+
     for i in range(3, len(df) - 3):
 
-        # Pivot Low
-        if low[i] == min(low[i-3:i+4]):
-            supports.append(low[i])
+        if highs[i] == max(highs[i-3:i+4]):
+            resistances.append(highs[i])
 
-        # Pivot High
-        if high[i] == max(high[i-3:i+4]):
-            resistances.append(high[i])
+        if lows[i] == min(lows[i-3:i+4]):
+            supports.append(lows[i])
 
-    def cluster_levels(levels):
+    price = df["close"].iloc[-1]
 
-        zones = []
+    supports = [
+        x for x in supports if x < price
+    ]
 
-        for price in sorted(levels):
+    resistances = [
+        x for x in resistances if x > price
+    ]
 
-            matched = False
+    supports = sorted(supports, reverse=True)[:4]
+    resistances = sorted(resistances)[:4]
 
-            for zone in zones:
-
-                if abs(price - zone["price"]) <= atr * 0.5:
-
-                    zone["prices"].append(price)
-                    zone["price"] = sum(
-                        zone["prices"]
-                    ) / len(zone["prices"])
-
-                    matched = True
-                    break
-
-            if not matched:
-                zones.append({
-                    "price": price,
-                    "prices": [price]
-                })
-
-        zones.sort(
-            key=lambda x: len(x["prices"]),
-            reverse=True
-        )
-
-        return zones[:4]
-
-    return (
-        cluster_levels(supports),
-        cluster_levels(resistances),
-        atr
-    )
+    return supports, resistances
 
 
-# ================= DRAW CHART =================
+# ================= CHART =================
 
 def create_chart(name, df):
 
-    supports, resistances, atr = find_zones(df)
+    fig, ax = plt.subplots(figsize=(15, 8))
 
-    fig, ax = plt.subplots(figsize=(15, 9))
+    dates = mdates.date2num(df["time"])
 
-    fig.patch.set_facecolor("#131722")
-    ax.set_facecolor("#131722")
-
-    width = 0.35
+    candle_width = 0.35
 
     for i, row in df.iterrows():
 
-        x = mdates.date2num(row["time"])
-
         color = (
-            "#26a69a"
+            "green"
             if row["close"] >= row["open"]
-            else "#ef5350"
+            else "red"
         )
 
         ax.plot(
-            [x, x],
+            [dates[i], dates[i]],
             [row["low"], row["high"]],
             color=color,
-            linewidth=1
+            linewidth=1.2
         )
 
-        bottom = min(row["open"], row["close"])
-        height = abs(row["close"] - row["open"])
+        body_height = abs(row["close"] - row["open"])
 
-        if height == 0:
-            height = atr * 0.015
+        if body_height == 0:
+            body_height = 0.0001
 
-        candle = Rectangle(
-            (x - width / 2, bottom),
-            width,
-            height,
+        rect = Rectangle(
+            (dates[i] - candle_width / 2,
+             min(row["open"], row["close"])),
+            candle_width,
+            body_height,
             facecolor=color,
             edgecolor=color
         )
 
-        ax.add_patch(candle)
+        ax.add_patch(rect)
 
-    # Support zones
-    for zone in supports:
-
-        price = zone["price"]
-
-        ax.axhspan(
-            price - atr * 0.20,
-            price + atr * 0.20,
-            color="#00c853",
-            alpha=0.20
-        )
-
-        ax.axhline(
-            price,
-            color="#00e676",
-            linewidth=1,
-            linestyle="--"
-        )
-
-    # Resistance zones
-    for zone in resistances:
-
-        price = zone["price"]
-
-        ax.axhspan(
-            price - atr * 0.20,
-            price + atr * 0.20,
-            color="#ff1744",
-            alpha=0.20
-        )
-
-        ax.axhline(
-            price,
-            color="#ff5252",
-            linewidth=1,
-            linestyle="--"
-        )
+    supports, resistances = find_zones(df)
 
     current_price = df["close"].iloc[-1]
 
-    ax.axhline(
-        current_price,
-        color="white",
-        linestyle=":",
-        linewidth=1
-    )
+    zone_width = current_price * 0.0015
+
+    # SUPPORT ZONES
+
+    for level in supports:
+
+        ax.axhspan(
+            level - zone_width,
+            level + zone_width,
+            color="green",
+            alpha=0.18
+        )
+
+    # RESISTANCE ZONES
+
+    for level in resistances:
+
+        ax.axhspan(
+            level - zone_width,
+            level + zone_width,
+            color="red",
+            alpha=0.18
+        )
 
     ax.set_title(
-        f"{name} | 12H MARKET ANALYSIS",
-        color="white",
-        fontsize=18,
-        pad=20
+        f"{name} / USDT - 12H",
+        fontsize=17
     )
+
+    ax.grid(alpha=0.15)
+
+    ax.xaxis_date()
 
     ax.xaxis.set_major_formatter(
         mdates.DateFormatter("%m-%d")
     )
 
-    ax.tick_params(colors="white")
-
-    for spine in ax.spines.values():
-        spine.set_color("#555555")
-
-    ax.grid(
-        alpha=0.15,
-        color="white"
-    )
-
     ax.set_xlim(
-        mdates.date2num(df["time"].iloc[0]) - 1,
-        mdates.date2num(df["time"].iloc[-1]) + 1
+        dates[0] - 1,
+        dates[-1] + 2
     )
 
     plt.tight_layout()
 
-    path = f"/tmp/{name}_12H.png"
+    filename = f"/tmp/{name}_12H.png"
 
     plt.savefig(
-        path,
+        filename,
         dpi=150,
-        facecolor=fig.get_facecolor()
+        bbox_inches="tight"
     )
 
-    plt.close(fig)
+    plt.close()
 
-    return path, supports, resistances, current_price
+    return filename
+
+
+# ================= TELEGRAM =================
+
+def send_photo(filename, caption):
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+
+    with open(filename, "rb") as photo:
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHANNEL_ID,
+                "caption": caption
+            },
+            files={
+                "photo": photo
+            },
+            timeout=40
+        )
+
+    response.raise_for_status()
+
+    if not response.json().get("ok"):
+        raise Exception(response.text)
+
+
+# ================= ANALYSIS =================
+
+def analyze(name, symbol):
+
+    print("Analyzing", name)
+
+    try:
+
+        df = get_binance_data(symbol)
+
+    except Exception as e:
+
+        print("Binance error:", name, e)
+
+        yahoo_symbols = {
+            "BTC": "BTC-USD",
+            "ETH": "ETH-USD"
+        }
+
+        df = get_yahoo_data(yahoo_symbols[name])
+
+    if len(df) < 30:
+        raise Exception("Not enough candle data")
+
+    filename = create_chart(name, df)
+
+    price = df["close"].iloc[-1]
+
+    supports, resistances = find_zones(df)
+
+    caption = (
+        f"📊 {name} / USDT\n"
+        f"⏱ Timeframe: 12H\n"
+        f"💰 Price: {price:,.4f}\n"
+        f"🟢 Support zones: {len(supports)}\n"
+        f"🔴 Resistance zones: {len(resistances)}\n"
+        f"📈 Technical Market Chart"
+    )
+
+    send_photo(filename, caption)
+
+    print("SUCCESS:", name)
 
 
 # ================= MAIN =================
@@ -344,58 +346,42 @@ def create_chart(name, df):
 def main():
 
     if not BOT_TOKEN or not CHANNEL_ID:
-        raise RuntimeError("Telegram secrets missing")
+        raise Exception("Telegram credentials missing")
 
-    telegram_message(
-        "📊 MARKET ANALYST PRO\n"
-        "شروع تحلیل بازار\n"
-        "⏱ تایم‌فریم: 12H\n"
-        "🟢 حمایت: Support Zones\n"
-        "🔴 مقاومت: Resistance Zones"
-    )
-
-    markets = {
-        "BTC": lambda: get_binance_data("BTCUSDT"),
-        "ETH": lambda: get_binance_data("ETHUSDT"),
-        "XAU": get_gold_data
-    }
-
-    for name, fetch in markets.items():
+    for name, symbol in SYMBOLS.items():
 
         try:
-
-            print(f"Analyzing {name}")
-
-            df = fetch()
-
-            path, supports, resistances, price = create_chart(
-                name, df
-            )
-
-            caption = (
-                f"📊 {name} | 12H\n"
-                f"💰 Current Price: {price:,.4f}\n"
-                f"🟢 Support Zones: {len(supports)}\n"
-                f"🔴 Resistance Zones: {len(resistances)}\n"
-                f"🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-            )
-
-            telegram_photo(path, caption)
-
-            print(f"SUCCESS: {name}")
+            analyze(name, symbol)
 
         except Exception as e:
-
             print(f"ERROR {name}: {e}")
 
-            telegram_message(
-                f"⚠️ Error analyzing {name}\n{str(e)[:500]}"
-            )
+        time.sleep(3)
 
-    telegram_message(
-        "✅ MARKET ANALYST PRO\n"
-        "گزارش بازار به پایان رسید."
-    )
+    try:
+
+        print("Analyzing XAU")
+
+        df = get_gold_data()
+
+        filename = create_chart("XAU", df)
+
+        price = df["close"].iloc[-1]
+
+        caption = (
+            f"🥇 GOLD / XAUUSD\n"
+            f"⏱ Timeframe: 12H\n"
+            f"💰 Price: {price:,.2f}\n"
+            f"📈 Technical Market Chart"
+        )
+
+        send_photo(filename, caption)
+
+        print("SUCCESS: XAU")
+
+    except Exception as e:
+
+        print("ERROR XAU:", e)
 
 
 if __name__ == "__main__":
