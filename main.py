@@ -182,10 +182,10 @@ def create_chart(name, df):
     for i, row in df.iterrows():
 
         color = (
-            "green"
-            if row["close"] >= row["open"]
-            else "red"
-        )
+    "#006400"  # سبز تیره
+    if row["close"] >= row["open"]
+    else "#D8B4FE"  # بنفش کم‌رنگ
+)
 
         ax.plot(
             [dates[i], dates[i]],
